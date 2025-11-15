@@ -36,8 +36,6 @@ class FeedbackSampler:
                 "cfg": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0, "step": 0.1}),
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
                 "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
-                "positive": ("CONDITIONING",),
-                "negative": ("CONDITIONING",),
                 "latent_image": ("LATENT",),
                 "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 
@@ -46,7 +44,18 @@ class FeedbackSampler:
                 "iterations": ("INT", {"default": 10, "min": 1, "max": 1000000}),
                 "feedback_denoise": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "seed_variation": (["fixed", "increment", "random"], {"default": "increment"}),
-                
+
+                # === Deforum Travel Parameters (2D) ===
+                "angle": ("FLOAT", {"default": 0.0, "min": -360.0, "max": 360.0, "step": 0.01}),
+                "translation_x": ("FLOAT", {"default": 0.0, "min": -500.0, "max": 500.0, "step": 0.1}),
+                "translation_y": ("FLOAT", {"default": 0.0, "min": -500.0, "max": 500.0, "step": 0.1}),
+
+                # === Deforum Travel Parameters (3D) ===
+                "translation_z": ("FLOAT", {"default": 0.0, "min": -500.0, "max": 500.0, "step": 0.1}),
+                "rotation_3d_x": ("FLOAT", {"default": 0.0, "min": -360.0, "max": 360.0, "step": 0.01}),
+                "rotation_3d_y": ("FLOAT", {"default": 0.0, "min": -360.0, "max": 360.0, "step": 0.01}),
+                "rotation_3d_z": ("FLOAT", {"default": 0.0, "min": -360.0, "max": 360.0, "step": 0.01}),
+
                 # === Color & Quality Enhancement ===
                 "color_coherence": (["None", "LAB", "RGB", "HSV"], {"default": "LAB"}),
                 "noise_amount": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.001, "round": 0.001}),
@@ -56,6 +65,28 @@ class FeedbackSampler:
             },
             "optional": {
                 "vae": ("VAE",),
+
+                # === Conditioning Inputs ===
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "positive_batch": ("CONDITIONING",),
+                "negative_batch": ("CONDITIONING",),
+
+                # === Prompt Schedule (standalone mode - not yet implemented) ===
+                "prompt_schedule": ("STRING", {"default": "", "multiline": True}),
+                "negative_prompt_schedule": ("STRING", {"default": "", "multiline": True}),
+
+                # === Motion Schedules (override static values) ===
+                # Format: "frame:(value), frame:(value)" - e.g., "0:(0), 20:(360)"
+                # Presets: Rotate: "0:(0), 30:(360)" | Pan: "0:(0), 30:(-200)" | Zoom: "0:(0.01), 30:(0.1)"
+                "angle_schedule": ("STRING", {"default": "", "multiline": False}),
+                "translation_x_schedule": ("STRING", {"default": "", "multiline": False}),
+                "translation_y_schedule": ("STRING", {"default": "", "multiline": False}),
+                "translation_z_schedule": ("STRING", {"default": "", "multiline": False}),
+                "rotation_3d_x_schedule": ("STRING", {"default": "", "multiline": False}),
+                "rotation_3d_y_schedule": ("STRING", {"default": "", "multiline": False}),
+                "rotation_3d_z_schedule": ("STRING", {"default": "", "multiline": False}),
+                "zoom_schedule": ("STRING", {"default": "", "multiline": False}),
             }
         }
     
@@ -63,7 +94,136 @@ class FeedbackSampler:
     RETURN_NAMES = ("final_latent", "all_latents")
     FUNCTION = "sample"
     CATEGORY = "sampling/custom"
-    
+
+    def parse_schedule(self, schedule_string, max_frames):
+        """
+        Parse FizzNodes-style schedule string into per-frame values.
+        Format: "0:(value1), 10:(value2), 20:(value3)"
+        Returns: List of interpolated values for each frame
+        """
+        import re
+        import numexpr
+
+        if not schedule_string or schedule_string.strip() == "":
+            return None
+
+        # Parse keyframes from string
+        keyframes = {}
+        pattern = r'(\d+):\s*\(([^)]+)\)'
+        matches = re.findall(pattern, schedule_string)
+
+        for frame_str, value_str in matches:
+            frame = int(frame_str)
+            # Support numexpr expressions
+            try:
+                value = float(numexpr.evaluate(value_str))
+            except:
+                value = float(value_str)
+            keyframes[frame] = value
+
+        if not keyframes:
+            return None
+
+        # Sort keyframes
+        sorted_frames = sorted(keyframes.keys())
+
+        # Interpolate values for all frames
+        values = []
+        for i in range(max_frames):
+            # Find surrounding keyframes
+            before_frame = None
+            after_frame = None
+
+            for kf in sorted_frames:
+                if kf <= i:
+                    before_frame = kf
+                if kf > i and after_frame is None:
+                    after_frame = kf
+
+            # Interpolate
+            if before_frame is None:
+                # Before first keyframe - use first value
+                values.append(keyframes[sorted_frames[0]])
+            elif after_frame is None:
+                # After last keyframe - use last value
+                values.append(keyframes[before_frame])
+            else:
+                # Between keyframes - linear interpolation
+                progress = (i - before_frame) / (after_frame - before_frame)
+                value = keyframes[before_frame] + (keyframes[after_frame] - keyframes[before_frame]) * progress
+                values.append(value)
+
+        return values
+
+    def parse_prompt_schedule(self, schedule_string, max_frames, clip):
+        """
+        Parse prompt schedule and return list of conditioning for each frame.
+        Format: "0: A cat, 10: A dog, 20: A bird"
+        """
+        import re
+
+        if not schedule_string or schedule_string.strip() == "":
+            return None
+
+        # Parse keyframes
+        keyframes = {}
+        # Match "frame: prompt text" pattern
+        pattern = r'(\d+):\s*([^,]+?)(?=\s*(?:\d+:|$))'
+        matches = re.findall(pattern, schedule_string.replace('\n', ' '))
+
+        for frame_str, prompt in matches:
+            frame = int(frame_str)
+            keyframes[frame] = prompt.strip()
+
+        if not keyframes:
+            return None
+
+        # Create conditioning for each keyframe
+        keyframe_conds = {}
+        for frame, prompt in keyframes.items():
+            tokens = clip.tokenize(prompt)
+            cond = clip.encode_from_tokens(tokens, return_pooled=True)
+            keyframe_conds[frame] = cond
+
+        # Interpolate between keyframes for all frames
+        sorted_frames = sorted(keyframes.keys())
+        frame_conds = []
+
+        for i in range(max_frames):
+            # Find surrounding keyframes
+            before_frame = None
+            after_frame = None
+
+            for kf in sorted_frames:
+                if kf <= i:
+                    before_frame = kf
+                if kf > i and after_frame is None:
+                    after_frame = kf
+
+            if before_frame is None:
+                # Before first keyframe
+                frame_conds.append(keyframe_conds[sorted_frames[0]])
+            elif after_frame is None:
+                # After last keyframe
+                frame_conds.append(keyframe_conds[before_frame])
+            else:
+                # Between keyframes - blend conditioning
+                progress = (i - before_frame) / (after_frame - before_frame)
+                weight = 1.0 - progress
+
+                # Blend the two conditionings
+                cond_from = keyframe_conds[before_frame]
+                cond_to = keyframe_conds[after_frame]
+
+                # Simple weighted blend (could use FizzNodes' addWeighted for better results)
+                blended = [[
+                    cond_from[0][0] * weight + cond_to[0][0] * (1.0 - weight),
+                    cond_from[0][1]  # Use first conditioning's metadata for now
+                ]]
+                frame_conds.append(blended)
+
+        return frame_conds
+
     def match_color_histogram(self, source, reference, mode="LAB"):
         """
         Match color histogram of source image to reference image.
@@ -350,7 +510,17 @@ class FeedbackSampler:
         if not SCIPY_AVAILABLE:
             print("    [Perlin noise unavailable without scipy, using Gaussian]", flush=True)
             return np.random.randn(*shape).astype(np.float32) * 0.5 + 0.5
-        
+
+        # Handle different shape formats
+        if len(shape) == 3:
+            H, W, C = shape
+        elif len(shape) == 4:
+            # Batch format [B, H, W, C] - use single image dimensions
+            B, H, W, C = shape
+            shape = (H, W, C)  # Generate noise for single image
+        else:
+            raise ValueError(f"Unexpected image shape format: {shape}")
+
         H, W, C = shape
         noise = np.zeros(shape, dtype=np.float32)
         
@@ -481,15 +651,24 @@ class FeedbackSampler:
         Positive zoom_factor = zoom in (scale up)
         Negative zoom_factor = zoom out (scale down)
         Zero = no change
+        Supports both 4D (standard) and 5D (Qwen/video) latents.
         """
         if zoom_factor == 0:
             return latent
-        
+
         # Calculate scale factor (1 + zoom means zoom in, 1 - zoom means zoom out)
         scale = 1.0 + zoom_factor
-        
-        # Get original dimensions
-        batch, channels, height, width = latent.shape
+
+        # Handle both 4D and 5D latent formats
+        is_5d = len(latent.shape) == 5
+        if is_5d:
+            # Qwen format: [batch, channels, depth, height, width]
+            batch, channels, depth, height, width = latent.shape
+            # Reshape to 4D for processing: merge depth into batch
+            latent = latent.reshape(batch * depth, channels, height, width)
+        else:
+            # Standard format: [batch, channels, height, width]
+            batch, channels, height, width = latent.shape
         
         # Calculate new dimensions for zoom
         if zoom_factor > 0:  # Zoom in - sample from center
@@ -521,22 +700,287 @@ class FeedbackSampler:
             
             # Pad to original size (padding with zeros)
             zoomed = F.pad(scaled, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
-        
+
+        # Reshape back to 5D if needed
+        if is_5d:
+            zoomed = zoomed.reshape(batch, depth, channels, height, width)
+            # Transpose to original format: [batch, channels, depth, height, width]
+            zoomed = zoomed.permute(0, 2, 1, 3, 4)
+
         return zoomed
-    
-    def sample(self, model, seed, steps, cfg, sampler_name, scheduler, positive, negative, 
+
+    def apply_deforum_transform(self, latent, angle=0.0, translation_x=0.0, translation_y=0.0,
+                                translation_z=0.0, rotation_3d_x=0.0, rotation_3d_y=0.0, rotation_3d_z=0.0):
+        """
+        Apply Deforum-style transformations to latent.
+        Combines 2D (angle, translate) and simulated 3D transformations.
+
+        Args:
+            latent: Tensor to transform
+            angle: 2D rotation in degrees (clockwise positive)
+            translation_x: Horizontal shift in pixels (right positive)
+            translation_y: Vertical shift in pixels (down positive)
+            translation_z: Depth translation (forward positive) - simulated with zoom
+            rotation_3d_x: Pitch rotation in degrees (tilt up/down)
+            rotation_3d_y: Yaw rotation in degrees (pan left/right)
+            rotation_3d_z: Roll rotation in degrees (roll clockwise/counter)
+        """
+        # Handle both 4D and 5D latent formats
+        is_5d = len(latent.shape) == 5
+        if is_5d:
+            batch, channels, depth, height, width = latent.shape
+            latent = latent.reshape(batch * depth, channels, height, width)
+        else:
+            batch, channels, height, width = latent.shape
+
+        # Apply 2D rotation (angle)
+        if angle != 0:
+            # Convert to radians
+            angle_rad = torch.tensor(angle * 3.14159 / 180.0)
+            # Create rotation matrix
+            cos_a = torch.cos(angle_rad)
+            sin_a = torch.sin(angle_rad)
+
+            # Create affine transformation matrix
+            theta = torch.tensor([[
+                [cos_a, -sin_a, 0],
+                [sin_a, cos_a, 0]
+            ]], dtype=latent.dtype, device=latent.device)
+
+            # Expand for batch
+            theta = theta.expand(latent.shape[0], 2, 3)
+
+            # Apply rotation
+            grid = F.affine_grid(theta, latent.size(), align_corners=False)
+            latent = F.grid_sample(latent, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+
+        # Apply 2D translation
+        if translation_x != 0 or translation_y != 0:
+            # Normalize translation to [-1, 1] range based on latent dimensions
+            tx = (translation_x / width) * 2.0
+            ty = (translation_y / height) * 2.0
+
+            # Create translation matrix
+            theta = torch.tensor([[
+                [1, 0, tx],
+                [0, 1, ty]
+            ]], dtype=latent.dtype, device=latent.device)
+
+            theta = theta.expand(latent.shape[0], 2, 3)
+            grid = F.affine_grid(theta, latent.size(), align_corners=False)
+            latent = F.grid_sample(latent, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+
+        # Apply translation_z as zoom (simulated depth)
+        if translation_z != 0:
+            # Positive Z = zoom in (move forward), negative = zoom out
+            zoom_factor = translation_z / 100.0  # Scale down for smoother effect
+            latent = self.zoom_latent(latent, zoom_factor)
+
+        # 3D rotations (simplified - apply as perspective-like transforms)
+        # Note: True 3D would require depth maps, so we simulate with 2D transforms
+
+        # rotation_3d_x (pitch - tilt up/down) - simulate with vertical scaling
+        if rotation_3d_x != 0:
+            scale_factor = 1.0 + (rotation_3d_x / 180.0) * 0.1  # Subtle effect
+            theta = torch.tensor([[
+                [1, 0, 0],
+                [0, scale_factor, 0]
+            ]], dtype=latent.dtype, device=latent.device)
+            theta = theta.expand(latent.shape[0], 2, 3)
+            grid = F.affine_grid(theta, latent.size(), align_corners=False)
+            latent = F.grid_sample(latent, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+
+        # rotation_3d_y (yaw - pan left/right) - simulate with horizontal shift
+        if rotation_3d_y != 0:
+            tx = (rotation_3d_y / 180.0) * 0.2  # Convert rotation to translation
+            theta = torch.tensor([[
+                [1, 0, tx],
+                [0, 1, 0]
+            ]], dtype=latent.dtype, device=latent.device)
+            theta = theta.expand(latent.shape[0], 2, 3)
+            grid = F.affine_grid(theta, latent.size(), align_corners=False)
+            latent = F.grid_sample(latent, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+
+        # rotation_3d_z (roll) - same as 2D angle rotation
+        if rotation_3d_z != 0:
+            angle_rad = torch.tensor(rotation_3d_z * 3.14159 / 180.0)
+            cos_a = torch.cos(angle_rad)
+            sin_a = torch.sin(angle_rad)
+            theta = torch.tensor([[
+                [cos_a, -sin_a, 0],
+                [sin_a, cos_a, 0]
+            ]], dtype=latent.dtype, device=latent.device)
+            theta = theta.expand(latent.shape[0], 2, 3)
+            grid = F.affine_grid(theta, latent.size(), align_corners=False)
+            latent = F.grid_sample(latent, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+
+        # Reshape back to 5D if needed
+        if is_5d:
+            latent = latent.reshape(batch, depth, channels, height, width)
+            latent = latent.permute(0, 2, 1, 3, 4)
+
+        return latent
+
+    def sample(self, model, seed, steps, cfg, sampler_name, scheduler,
                latent_image, denoise, zoom_value, iterations, feedback_denoise, seed_variation,
-               color_coherence, noise_amount, noise_type="perlin", sharpen_amount=0.1, contrast_boost=1.0, vae=None):
+               angle, translation_x, translation_y, translation_z, rotation_3d_x, rotation_3d_y, rotation_3d_z,
+               color_coherence, noise_amount, noise_type, sharpen_amount, contrast_boost,
+               vae=None, positive=None, negative=None, positive_batch=None, negative_batch=None,
+               prompt_schedule="", negative_prompt_schedule="",
+               angle_schedule="", translation_x_schedule="", translation_y_schedule="",
+               translation_z_schedule="", rotation_3d_x_schedule="", rotation_3d_y_schedule="",
+               rotation_3d_z_schedule="", zoom_schedule=""):
         """
         Main sampling function with feedback loop, zoom, and color coherence.
+        Now with FizzNodes-style prompt and motion scheduling!
         """
         import random
-        
+
+        print(f"\n=== FeedbackSampler v2.0 with Prompt & Motion Scheduling ===")
+
+        # === STEP 1: Process Conditioning (Batch or Scheduled) ===
+        positive_conds = []
+        negative_conds = []
+
+        # Helper function to unbatch conditioning if needed
+        def unbatch_conditioning(cond_batch):
+            """
+            Convert batched conditioning to list format.
+            Input: [[tensor, metadata]] where tensor might have batch dimension > 1
+            Output: [[tensor1, metadata1], [tensor2, metadata2], ...]
+            """
+            if not cond_batch or len(cond_batch) == 0:
+                return []
+
+            # Check if the conditioning tensor has a batch dimension > 1
+            first_item = cond_batch[0]
+            if isinstance(first_item, list) and len(first_item) >= 1:
+                cond_tensor = first_item[0]
+                cond_metadata = first_item[1] if len(first_item) > 1 else {}
+
+                # Ensure metadata is a dict
+                if not isinstance(cond_metadata, dict):
+                    print(f"[Conditioning] Warning: metadata is not a dict, it's {type(cond_metadata)}")
+                    cond_metadata = {}
+
+                # If batch dimension is > 1, split into individual frames
+                if cond_tensor.shape[0] > 1:
+                    print(f"[Conditioning] Unbatching tensor with shape {cond_tensor.shape} into {cond_tensor.shape[0]} frames")
+                    result = []
+
+                    # Check if pooled_output also needs unbatching
+                    pooled = cond_metadata.get("pooled_output", None)
+                    has_pooled = pooled is not None and hasattr(pooled, 'shape') and pooled.shape[0] == cond_tensor.shape[0]
+
+                    for i in range(cond_tensor.shape[0]):
+                        frame_tensor = cond_tensor[i:i+1]  # Keep batch dimension as 1
+                        # Create a new dict for each frame's metadata
+                        frame_metadata = {}
+
+                        # Copy non-tensor metadata
+                        for key, value in cond_metadata.items():
+                            if key == "pooled_output" and has_pooled:
+                                # Split the pooled output
+                                frame_metadata["pooled_output"] = pooled[i:i+1]
+                            elif not hasattr(value, 'shape'):
+                                # Copy non-tensor values directly
+                                frame_metadata[key] = value
+
+                        result.append([frame_tensor, frame_metadata])
+
+                    return result
+                else:
+                    # Already in correct format
+                    return cond_batch
+            else:
+                return cond_batch
+
+        # Priority: 1. Batch conditioning (for scheduled prompt transitions), 2. Static conditioning
+        if positive_batch is not None:
+            print(f"[Conditioning] Using batch conditioning from FizzNodes")
+
+            # Unbatch if necessary
+            positive_batch = unbatch_conditioning(positive_batch)
+            if negative_batch is not None:
+                negative_batch = unbatch_conditioning(negative_batch)
+
+            # FizzNodes outputs a list where each element is [[tensor, metadata]]
+            # We want to map each batch element to each frame
+            batch_len = len(positive_batch)
+
+            # Wrap each frame's conditioning in a list for common_ksampler
+            # positive_batch is [[tensor1, dict1], [tensor2, dict2], ...]
+            # We need positive_conds to be [[[tensor1, dict1]], [[tensor2, dict2]], ...]
+            if batch_len == iterations:
+                print(f"[Conditioning] Perfect match: {batch_len} conditionings for {iterations} frames")
+                positive_conds = [[item] for item in positive_batch]
+                negative_conds = [[item] for item in negative_batch] if negative_batch is not None else [[positive_batch[0]]] * iterations
+            elif batch_len == 1:
+                # Single conditioning - use for all frames (typical FeedbackSampler usage)
+                print(f"[Conditioning] Using single conditioning for all {iterations} frames")
+                positive_conds = [[positive_batch[0]]] * iterations
+                negative_conds = [[negative_batch[0]]] * iterations if negative_batch is not None else [[positive_batch[0]]] * iterations
+            elif batch_len < iterations:
+                # Fewer conditionings than frames - interpolate or repeat
+                print(f"[Conditioning] Interpolating {batch_len} conditionings across {iterations} frames")
+                # Simple approach: repeat last conditioning for remaining frames
+                positive_conds = [[item] for item in positive_batch]
+                while len(positive_conds) < iterations:
+                    positive_conds.append([positive_batch[-1]])
+
+                if negative_batch is not None:
+                    negative_conds = [[item] for item in negative_batch]
+                    while len(negative_conds) < iterations:
+                        negative_conds.append([negative_batch[-1]])
+                else:
+                    negative_conds = [[item] for item in positive_batch] * iterations
+            else:
+                # More conditionings than frames - use subset
+                print(f"[Conditioning] Using first {iterations} of {batch_len} conditionings")
+                positive_conds = [[item] for item in positive_batch[:iterations]]
+                negative_conds = [[item] for item in negative_batch[:iterations]] if negative_batch is not None else [[item] for item in positive_batch[:iterations]]
+
+        elif positive is not None and negative is not None:
+            print(f"[Conditioning] Using static conditioning for all {iterations} frames")
+            positive_conds = [positive] * iterations
+            negative_conds = [negative] * iterations
+        else:
+            raise ValueError("Either connect static conditioning (positive/negative) OR batch conditioning (positive_batch/negative_batch)")
+
+        # === STEP 2: Parse Motion Schedules ===
+        print(f"[Motion] Processing motion schedules...")
+
+        # Parse all motion schedules or use static values
+        angle_values = self.parse_schedule(angle_schedule, iterations) if angle_schedule else [angle] * iterations
+        tx_values = self.parse_schedule(translation_x_schedule, iterations) if translation_x_schedule else [translation_x] * iterations
+        ty_values = self.parse_schedule(translation_y_schedule, iterations) if translation_y_schedule else [translation_y] * iterations
+        tz_values = self.parse_schedule(translation_z_schedule, iterations) if translation_z_schedule else [translation_z] * iterations
+        rx_values = self.parse_schedule(rotation_3d_x_schedule, iterations) if rotation_3d_x_schedule else [rotation_3d_x] * iterations
+        ry_values = self.parse_schedule(rotation_3d_y_schedule, iterations) if rotation_3d_y_schedule else [rotation_3d_y] * iterations
+        rz_values = self.parse_schedule(rotation_3d_z_schedule, iterations) if rotation_3d_z_schedule else [rotation_3d_z] * iterations
+        zoom_values = self.parse_schedule(zoom_schedule, iterations) if zoom_schedule else [zoom_value] * iterations
+
+        # Print schedule info
+        schedules_active = []
+        if angle_schedule: schedules_active.append("angle")
+        if translation_x_schedule: schedules_active.append("translation_x")
+        if translation_y_schedule: schedules_active.append("translation_y")
+        if translation_z_schedule: schedules_active.append("translation_z")
+        if rotation_3d_x_schedule: schedules_active.append("rotation_3d_x")
+        if rotation_3d_y_schedule: schedules_active.append("rotation_3d_y")
+        if rotation_3d_z_schedule: schedules_active.append("rotation_3d_z")
+        if zoom_schedule: schedules_active.append("zoom")
+
+        if schedules_active:
+            print(f"[Motion] Active schedules: {', '.join(schedules_active)}")
+        else:
+            print(f"[Motion] Using static values (no schedules)")
+
         # Check if VAE is available for color coherence
         if color_coherence != "None" and vae is None:
             print("WARNING: Color coherence requested but no VAE provided. Disabling color coherence.")
             color_coherence = "None"
-        
+
         # Store all latents for output
         all_latents = []
         color_reference = None  # Store first frame for color matching
@@ -545,25 +989,34 @@ class FeedbackSampler:
         current_latent = latent_image["samples"].clone()
         latent_format = latent_image.copy()
         
-        # First iteration with full denoise
-        print(f"FeedbackSampler v1.4.3: Starting iteration 1/{iterations} with denoise={denoise}")
+        # === STEP 3: First Iteration with Full Denoise ===
+        print(f"\n[Frame 0] Starting first iteration with denoise={denoise}")
         latent_format["samples"] = current_latent
-        
-        # Sample first iteration
+
+        # Debug: Check conditioning structure
+        print(f"[Debug] positive_conds[0] type: {type(positive_conds[0])}")
+        if isinstance(positive_conds[0], list):
+            print(f"[Debug] positive_conds[0] length: {len(positive_conds[0])}")
+            if len(positive_conds[0]) > 0:
+                print(f"[Debug] positive_conds[0][0] type: {type(positive_conds[0][0])}, shape: {positive_conds[0][0].shape if hasattr(positive_conds[0][0], 'shape') else 'N/A'}")
+            if len(positive_conds[0]) > 1:
+                print(f"[Debug] positive_conds[0][1] type: {type(positive_conds[0][1])}")
+
+        # Use first frame's conditioning
         result = nodes.common_ksampler(
             model, seed, steps, cfg, sampler_name, scheduler,
-            positive, negative, latent_format, denoise=denoise
+            positive_conds[0], negative_conds[0], latent_format, denoise=denoise
         )
-        
+
         current_latent = result[0]["samples"]
         all_latents.append(current_latent.clone())
-        
+
         # Store first frame as color reference
         if color_coherence != "None" and vae is not None:
             color_reference = self.latent_to_image(current_latent, vae)
-            print(f"FeedbackSampler: Stored Frame 0 as color reference ({color_coherence} mode)")
-        
-        # Feedback loop iterations
+            print(f"[Frame 0] Stored as color reference ({color_coherence} mode)")
+
+        # === STEP 4: Feedback Loop with Scheduled Motion & Conditioning ===
         for i in range(1, iterations):
             # Determine seed for this iteration
             if seed_variation == "fixed":
@@ -572,11 +1025,37 @@ class FeedbackSampler:
                 iteration_seed = seed + i
             else:  # random
                 iteration_seed = random.randint(0, 0xffffffffffffffff)
-            
-            print(f"FeedbackSampler: Iteration {i+1}/{iterations} | zoom={zoom_value} | denoise={feedback_denoise} | seed={iteration_seed} | noise={noise_amount}({noise_type}) | sharpen={sharpen_amount}")
-            
-            # Apply zoom transformation
-            zoomed_latent = self.zoom_latent(current_latent, zoom_value)
+
+            # Get scheduled values for this frame
+            frame_angle = angle_values[i]
+            frame_tx = tx_values[i]
+            frame_ty = ty_values[i]
+            frame_tz = tz_values[i]
+            frame_rx = rx_values[i]
+            frame_ry = ry_values[i]
+            frame_rz = rz_values[i]
+            frame_zoom = zoom_values[i]
+
+            print(f"\n[Frame {i}] zoom={frame_zoom:.4f} | angle={frame_angle:.2f}° | tx={frame_tx:.1f} ty={frame_ty:.1f} tz={frame_tz:.1f}")
+            print(f"         denoise={feedback_denoise} | seed={iteration_seed}")
+
+            # Apply transformations GENTLY to preserve coherency
+            # Start with zoom only (most stable)
+            zoomed_latent = self.zoom_latent(current_latent, frame_zoom)
+
+            # Only apply other transforms if they're non-zero (skip if static)
+            if frame_angle != 0 or frame_tx != 0 or frame_ty != 0 or frame_tz != 0 or frame_rx != 0 or frame_ry != 0 or frame_rz != 0:
+                # Apply gentle Deforum transformations
+                zoomed_latent = self.apply_deforum_transform(
+                    zoomed_latent,
+                    angle=frame_angle * 0.5,  # Reduce intensity by 50% for coherency
+                    translation_x=frame_tx * 0.5,
+                    translation_y=frame_ty * 0.5,
+                    translation_z=frame_tz * 0.5,
+                    rotation_3d_x=frame_rx * 0.5,
+                    rotation_3d_y=frame_ry * 0.5,
+                    rotation_3d_z=frame_rz * 0.5
+                )
             
             # CRITICAL: Apply color coherence + enhancements BEFORE generation
             if color_coherence != "None" and vae is not None and color_reference is not None:
@@ -628,13 +1107,13 @@ class FeedbackSampler:
             
             # Prepare for next sampling
             latent_format["samples"] = zoomed_latent
-            
-            # Sample with feedback denoise value
+
+            # Sample with feedback denoise value using per-frame conditioning
             result = nodes.common_ksampler(
                 model, iteration_seed, steps, cfg, sampler_name, scheduler,
-                positive, negative, latent_format, denoise=feedback_denoise
+                positive_conds[i], negative_conds[i], latent_format, denoise=feedback_denoise
             )
-            
+
             current_latent = result[0]["samples"]
             all_latents.append(current_latent.clone())
         
